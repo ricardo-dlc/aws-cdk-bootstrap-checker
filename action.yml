@@ -1,0 +1,90 @@
+name: "CDK Bootstrap Check and Update"
+description: "Check if CDK bootstrap is needed and perform bootstrap if required"
+
+inputs:
+  aws-region:
+    description: "AWS Region to bootstrap"
+    required: true
+  aws-account-id:
+    description: "AWS Account ID to bootstrap"
+    required: true
+  force-update:
+    description: "Force update of bootstrap stack even if it exists"
+    required: false
+    default: "true"
+  termination-protection:
+    description: "Enable termination protection for bootstrap stack"
+    required: false
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - name: Instal yq
+      shell: bash
+      run: |
+        set +e
+        # Create a directory to install yq if it doesn't exist
+        mkdir -p $HOME/bin
+        # Install yq to the user's bin directory
+        wget -q https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O $HOME/bin/yq &&\
+        chmod +x $HOME/bin/yq
+        # Add $HOME/bin to the PATH for subsequent steps
+        echo "PATH=$HOME/bin:$PATH" >> $GITHUB_ENV
+    - name: Check Bootstrap Stack and Version
+      id: check-bootstrap
+      shell: bash
+      run: |
+        set +e
+        # Try to describe the stack and capture output
+        STACK_INFO=$(aws cloudformation describe-stacks --stack-name CDKToolkit --region ${{ inputs.aws-region }} 2>/dev/null)
+        STACK_EXISTS=$?
+
+        if [ $STACK_EXISTS -eq 0 ]; then
+          echo "CDKToolkit stack exists, checking version..."
+
+          # Extract the current bootstrap version from the stack outputs
+          CURRENT_VERSION=$(echo "$STACK_INFO" | jq -r '.Stacks[0].Outputs[] | select(.OutputKey=="BootstrapVersion").OutputValue')
+
+          # Get the required bootstrap version from cdk
+          REQUIRED_VERSION=$(npx cdk bootstrap --show-template | yq '.Resources.CdkBootstrapVersion.Properties.Value')
+
+          echo "Current bootstrap version: $CURRENT_VERSION"
+          echo "Required bootstrap version: $REQUIRED_VERSION"
+
+          # Compare versions
+          if [ "$CURRENT_VERSION" -lt "$REQUIRED_VERSION" ]; then
+            echo "NEEDS_BOOTSTRAP=true" >> $GITHUB_ENV
+            echo "Bootstrap version is outdated and needs updating"
+          else
+            echo "NEEDS_BOOTSTRAP=false" >> $GITHUB_ENV
+            echo "Bootstrap version is up to date"
+          fi
+        else
+          echo "CDKToolkit stack does not exist"
+          echo "NEEDS_BOOTSTRAP=true" >> $GITHUB_ENV
+        fi
+
+    - name: Bootstrap AWS Environment
+      if: env.NEEDS_BOOTSTRAP == 'true'
+      shell: bash
+      run: |
+        BOOTSTRAP_CMD="npx cdk bootstrap aws://${{ inputs.aws-account-id }}/${{ inputs.aws-region }}"
+
+        if [ "${{ inputs.force-update }}" == "true" ]; then
+          BOOTSTRAP_CMD="$BOOTSTRAP_CMD --force"
+        fi
+
+        if [ "${{ inputs.termination-protection }}" == "true" ]; then
+          BOOTSTRAP_CMD="$BOOTSTRAP_CMD --termination-protection"
+        fi
+
+        echo "Running: $BOOTSTRAP_CMD"
+        eval "$BOOTSTRAP_CMD"
+
+        if [ $? -eq 0 ]; then
+          echo "Bootstrap completed successfully"
+        else
+          echo "Bootstrap failed"
+          exit 1
+        fi
